@@ -77,6 +77,24 @@ MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
 
+def _generate_autoinject_runner(enabled_tools: list[str]) -> str:
+    """Generate a runner that exposes sandbox tools without rewriting source."""
+    available = sorted(set(SANDBOX_ALLOWED_TOOLS) & set(enabled_tools))
+    imports = ""
+    globals_dict = "{}"
+    if available:
+        names = ", ".join(available)
+        imports = f"from hermes_tools import {names}\n"
+        globals_dict = "{" + ", ".join(f"{name!r}: {name}" for name in available) + "}"
+    return (
+        "import os\n"
+        "import runpy\n"
+        f"{imports}"
+        "script = os.path.join(os.path.dirname(__file__), 'script.py')\n"
+        f"runpy.run_path(script, init_globals={globals_dict}, run_name='__main__')\n"
+    )
+
+
 def _assemble_stdout_result(
     head: bytes,
     tail: bytes = b"",
@@ -1132,12 +1150,16 @@ def _execute_remote(
 
         rpc_token = secrets.token_urlsafe(32)
 
-        # Generate and ship files
+        # Keep user source untouched; the runner supplies enabled tools as globals.
         tools_src = generate_hermes_tools_module(
             list(sandbox_tools), transport="file",
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
+        _ship_file_to_remote(
+            env, f"{sandbox_dir}/runner.py",
+            _generate_autoinject_runner(list(sandbox_tools)),
+        )
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else sandbox RPC tool calls lose approval
@@ -1167,7 +1189,7 @@ def _execute_remote(
         logger.info("Executing code on %s backend (task %s)...",
                      env_type, effective_task_id[:8])
         script_result = env.execute(
-            f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
+            f"cd {quoted_sandbox_dir} && {env_prefix} python3 runner.py",
             timeout=timeout,
         )
 
@@ -1390,9 +1412,11 @@ def execute_code(
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
-        # Write the user's script
+        # Keep user source untouched; the runner supplies enabled tools as globals.
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
             f.write(code)
+        with open(os.path.join(tmpdir, "runner.py"), "w", encoding="utf-8") as f:
+            f.write(_generate_autoinject_runner(list(sandbox_tools)))
 
         # --- Start RPC server ---
         rpc_token = secrets.token_urlsafe(32)
@@ -1491,10 +1515,10 @@ def execute_code(
         _mode = _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
-        _script_path = os.path.join(tmpdir, "script.py")
+        _runner_path = os.path.join(tmpdir, "runner.py")
 
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            [_child_python, _runner_path],
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -2003,15 +2027,6 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         doc for name, doc in _TOOL_DOC_LINES if name in enabled_sandbox_tools
     )
 
-    # Build example import list from enabled tools
-    import_examples = [n for n in ("web_search", "terminal") if n in enabled_sandbox_tools]
-    if not import_examples:
-        import_examples = sorted(enabled_sandbox_tools)[:2]
-    if import_examples:
-        import_str = ", ".join(import_examples) + ", ..."
-    else:
-        import_str = "..."
-
     # Mode-specific CWD guidance. Project mode is the default and matches
     # terminal()'s filesystem/interpreter; strict mode retains the isolated
     # temp-dir staging and hermes-agent's own python.
@@ -2027,13 +2042,15 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         )
 
     description = (
-        "Run a Python script that calls Hermes tools programmatically. "
-        "Use when you need 3+ tool calls with logic between them: "
-        "filtering/reducing large outputs before they enter context, "
-        "conditional branching, or loops (N pages/files, retry on failure). "
-        "Use normal tool calls for single calls, results you must reason "
-        "over in full, or anything needing user interaction.\n\n"
-        f"Available via `from hermes_tools import ...`:\n\n"
+        "Run a Python script that can call Hermes tools programmatically. "
+        "Use this when you need 3+ tool calls with processing logic between them, "
+        "need to filter/reduce large tool outputs before they enter your context, "
+        "need conditional branching (if X then Y else Z), or need to loop "
+        "(fetch N pages, process N files, retry on failure).\n\n"
+        "Use normal tool calls instead when: single tool call with no processing, "
+        "you need to see the full result and apply complex reasoning, "
+        "or the task requires interactive user input.\n\n"
+        "The following tools are automatically available without imports:\n\n"
         f"{tool_lines}\n\n"
         "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
@@ -2054,9 +2071,11 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
                 "code": {
                     "type": "string",
                     "description": (
-                        "Python code to execute. Import tools with "
-                        f"`from hermes_tools import {import_str}` "
-                        "and print your final result to stdout."
+                        "Python code to execute. The listed Hermes tools are "
+                        "available directly without imports, and the "
+                        "json_parse / shell_quote / retry helpers are "
+                        "available as built-ins. Print your final result "
+                        "to stdout."
                     ),
                 },
             },
